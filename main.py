@@ -13,7 +13,19 @@ def ask(prompt: str, default: str = "") -> str:
     return val if val else default
 
 
-def show_diff(
+def print_progress_bar(done: int, total: int, ok_cnt: int, fail_cnt: int, current_id: int) -> None:
+    width = 24
+    pct = (done / total) if total else 1.0
+    filled = int(width * pct)
+    bar = "█" * filled + "░" * (width - filled)
+    print(
+        f"\r  [{bar}] {pct * 100:5.1f}% ({done}/{total}) | ok:{ok_cnt} fail:{fail_cnt} | #{current_id}",
+        end="",
+        flush=True,
+    )
+
+
+def format_compact_diff(
     post_id: int,
     old_tags: list[str],
     new_tags: list[str],
@@ -21,18 +33,19 @@ def show_diff(
     new_r: str,
     old_s: str,
     new_s: str,
-) -> None:
+) -> str:
     added = [t for t in new_tags if t not in set(old_tags)]
     removed = [t for t in old_tags if t not in set(new_tags)]
-    print(f"  #{post_id}:")
+    parts: list[str] = []
     if added:
-        print(f"    + {' '.join(added)}")
+        parts.append("+ " + " ".join(added))
     if removed:
-        print(f"    - {' '.join(removed)}")
+        parts.append("- " + " ".join(removed))
     if new_r != old_r:
-        print(f"    rating: {old_r or '-'} -> {new_r}")
+        parts.append(f"rating:{old_r or '-'}->{new_r}")
     if new_s != old_s:
-        print(f"    source: {old_s or '-'} -> {new_s}")
+        parts.append(f"source:{old_s or '-'}->{new_s}")
+    return f"  #{post_id}: " + " | ".join(parts)
 
 
 async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
@@ -85,19 +98,25 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
             print(f"No posts require '{mode}' changes.")
             return
 
-        print(f"\n--- Preview ({len(plan)} post(s) to update) ---")
-        for pid, old_t, new_t, r, s in plan[:25]:
-            show_diff(pid, old_t, new_t, r, r, s, s)
-        if len(plan) > 25:
-            print(f"  ... {len(plan) - 25} more")
+        print(f"\nPreview ({len(plan)} post(s)):")
+        for pid, old_t, new_t, r, s in plan[:15]:
+            print(format_compact_diff(pid, old_t, new_t, r, r, s, s))
+        if len(plan) > 15:
+            print(f"  ... +{len(plan) - 15} more")
 
-        if ask("Apply changes? (y/N)", "n").lower() != "y":
-            print("Cancelled.")
-            return
+        if not cfg.auto_yes:
+            if ask("Apply changes? (y/N)", "n").lower() != "y":
+                print("Cancelled.")
+                return
+        else:
+            print("Auto-Yes enabled -> applying changes...")
 
         removed_set = set(target_tags) if mode == "remove" else set()
         ok_cnt = fail_cnt = 0
-        for pid, _, new_t, r, s in plan:
+        failures: list[str] = []
+        total = len(plan)
+
+        for idx, (pid, _, new_t, r, s) in enumerate(plan, start=1):
             ok, msg = await api.update_post(
                 pid,
                 " ".join(new_t),
@@ -109,8 +128,13 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
                 ok_cnt += 1
             else:
                 fail_cnt += 1
-                print(f"  #{pid} failed: {msg}")
-        print(f"Finished. Updated: {ok_cnt}, Failed: {fail_cnt} (CSV log: {cfg.debug_csv})")
+                failures.append(f"#{pid}: {msg}")
+            print_progress_bar(idx, total, ok_cnt, fail_cnt, pid)
+
+        print()
+        for f_msg in failures:
+            print(f"  FAILED {f_msg}")
+        print(f"Done. Updated: {ok_cnt}, Failed: {fail_cnt} (CSV log: {cfg.debug_csv})")
 
 
 async def run_metadata_edit(cfg: Config, logger) -> None:
@@ -150,28 +174,41 @@ async def run_metadata_edit(cfg: Config, logger) -> None:
             print("No posts need metadata changes.")
             return
 
-        print(f"\n--- Metadata Preview ({len(plan)} post(s)) ---")
-        for pid, t_str, old_r, tgt_r, old_s, tgt_s in plan[:25]:
+        print(f"\nMetadata Preview ({len(plan)} post(s)):")
+        for pid, t_str, old_r, tgt_r, old_s, tgt_s in plan[:15]:
             t_list = t_str.split()
-            show_diff(pid, t_list, t_list, old_r, tgt_r, old_s, tgt_s)
+            print(format_compact_diff(pid, t_list, t_list, old_r, tgt_r, old_s, tgt_s))
+        if len(plan) > 15:
+            print(f"  ... +{len(plan) - 15} more")
 
-        if ask("Apply metadata changes? (y/N)", "n").lower() != "y":
-            print("Cancelled.")
-            return
+        if not cfg.auto_yes:
+            if ask("Apply metadata changes? (y/N)", "n").lower() != "y":
+                print("Cancelled.")
+                return
+        else:
+            print("Auto-Yes enabled -> applying metadata changes...")
 
         ok_cnt = fail_cnt = 0
-        for pid, t_str, _, tgt_r, _, tgt_s in plan:
+        failures: list[str] = []
+        total = len(plan)
+
+        for idx, (pid, t_str, _, tgt_r, _, tgt_s) in enumerate(plan, start=1):
             ok, msg = await api.update_post(pid, t_str, rating=tgt_r or None, source=tgt_s)
             if ok:
                 ok_cnt += 1
             else:
                 fail_cnt += 1
-                print(f"  #{pid} failed: {msg}")
-        print(f"Finished. Updated: {ok_cnt}, Failed: {fail_cnt} (CSV log: {cfg.debug_csv})")
+                failures.append(f"#{pid}: {msg}")
+            print_progress_bar(idx, total, ok_cnt, fail_cnt, pid)
+
+        print()
+        for f_msg in failures:
+            print(f"  FAILED {f_msg}")
+        print(f"Done. Updated: {ok_cnt}, Failed: {fail_cnt} (CSV log: {cfg.debug_csv})")
 
 
 def configure_auth(cfg: Config, logger) -> None:
-    print(f"Current status -> {cfg.auth_summary()}")
+    print(f"Current -> {cfg.auth_summary()}")
     quick_str = ask("Paste '&api_key=...&user_id=...' or press Enter to keep/enter separately", "")
     if "api_key=" in quick_str or "user_id=" in quick_str:
         parsed = parse_qs(quick_str.lstrip("&?"))
@@ -187,13 +224,19 @@ def configure_auth(cfg: Config, logger) -> None:
     rps = ask("Max requests/sec", str(cfg.max_rps))
     if rps.isdigit() and int(rps) > 0:
         cfg.max_rps = int(rps)
+    auto_in = ask("Auto-confirm 'y' without prompting? (y/n)", "y" if cfg.auto_yes else "n").lower()
+    if auto_in in ("y", "yes", "true", "1"):
+        cfg.auto_yes = True
+    elif auto_in in ("n", "no", "false", "0"):
+        cfg.auto_yes = False
+
     cfg.save()
     logger.info(
         "Saved settings to %s",
         cfg.settings_file,
         extra={"action": "configure_auth", "status": "saved"},
     )
-    print(f"Saved -> {cfg.auth_summary()} (stored in {cfg.settings_file})")
+    print(f"Saved -> {cfg.auth_summary()}")
 
 
 async def menu_loop() -> None:
@@ -208,7 +251,7 @@ async def menu_loop() -> None:
         print("1. Remove tags from posts")
         print("2. Add tags to posts")
         print("3. Modify metadata (rating / source)")
-        print("4. Credentials & Cookies")
+        print("4. Credentials, Cookies & Auto-Yes")
         print("5. Exit")
 
         choice = input("Choose: ").strip()

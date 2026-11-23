@@ -3,5 +3,6 @@
   "api_key": "INSERT API KEY",
   "user_id": "INSERT USER ID",
   "cookie_header": "INSERT REQUEST COOKIE HEADER",
-  "max_rps": 10
+  "max_rps": 10,
+  "auto_yes": false
 }

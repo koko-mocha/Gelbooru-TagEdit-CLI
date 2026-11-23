@@ -14,6 +14,7 @@ class Config:
     cookie_header: str = ""
     max_rps: int = 10
     page_limit: int = 100
+    auto_yes: bool = False
     settings_file: Path = Path("gelbooru_settings.json")
     debug_csv: Path = Path("logs/gelbooru_debug.csv")
 
@@ -26,7 +27,8 @@ class Config:
     def auth_summary(self) -> str:
         api_state = "SET" if self.has_api_creds() else "MISSING"
         cookie_state = "SET" if self.has_cookies() else "MISSING"
-        return f"API Creds: {api_state} (uid={self.user_id or '-'}) | Cookies: {cookie_state}"
+        auto_state = "ON" if self.auto_yes else "OFF"
+        return f"API Creds: {api_state} (uid={self.user_id or '-'}) | Cookies: {cookie_state} | Auto-Yes: {auto_state}"
 
     def load_saved(self) -> None:
         if self.settings_file.exists():
@@ -36,6 +38,7 @@ class Config:
             self.user_id = str(data.get("user_id", self.user_id)).strip()
             self.cookie_header = str(data.get("cookie_header", self.cookie_header)).strip()
             self.max_rps = max(1, int(data.get("max_rps", self.max_rps)))
+            self.auto_yes = bool(data.get("auto_yes", self.auto_yes))
 
     def save(self) -> None:
         payload = {
@@ -44,6 +47,7 @@ class Config:
             "user_id": self.user_id,
             "cookie_header": self.cookie_header,
             "max_rps": self.max_rps,
+            "auto_yes": self.auto_yes,
         }
         self.settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
