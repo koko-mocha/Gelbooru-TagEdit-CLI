@@ -53,6 +53,7 @@ class GelbooruAPI:
         self.logger = logger
         self.limiter = RateLimiter(cfg.max_rps)
         self._session: aiohttp.ClientSession | None = None
+        self._success_streak: int = 0
 
     def _log(
         self,
@@ -95,7 +96,12 @@ class GelbooruAPI:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if exc is not None:
-            self._log(logging.ERROR, f"Session exited with {exc_type.__name__ if exc_type else 'err'}: {exc}", action="session", status="error")
+            self._log(
+                logging.ERROR,
+                f"Session exited with {exc_type.__name__ if exc_type else 'err'}: {exc}",
+                action="session",
+                status="error",
+            )
         if self._session:
             await self._session.close()
             self._session = None
@@ -186,7 +192,6 @@ class GelbooruAPI:
     def _extract_form_payload(self, form_body: str) -> dict[str, str]:
         payload: dict[str, str] = {}
 
-        # 1. All <input> elements
         for m in re.finditer(r"<input\b([^>]*)/?>", form_body, re.I):
             attrs = m.group(1)
             nm = re.search(r'\bname=["\']([^"\']+)["\']', attrs, re.I)
@@ -206,7 +211,6 @@ class GelbooruAPI:
             else:
                 payload[name] = val
 
-        # 2. <select> elements (selected option or first option)
         for sm in re.finditer(r'<select\b([^>]*)>(.*?)</select>', form_body, re.S | re.I):
             s_attrs, s_body = sm.group(1), sm.group(2)
             snm = re.search(r'\bname=["\']([^"\']+)["\']', s_attrs, re.I)
@@ -221,7 +225,6 @@ class GelbooruAPI:
                 if opt_first:
                     payload[s_name] = html.unescape(opt_first.group(1))
 
-        # 3. Any non-tags <textarea>
         for tam in re.finditer(r'<textarea\b([^>]*)>(.*?)</textarea>', form_body, re.S | re.I):
             ta_attrs, ta_val = tam.group(1), tam.group(2)
             tanm = re.search(r'\bname=["\']([^"\']+)["\']', ta_attrs, re.I)
@@ -232,6 +235,71 @@ class GelbooruAPI:
                 payload[ta_name] = html.unescape(ta_val)
 
         return payload
+
+    def _should_verify_post(self, post_id: int, status: int, loc: str, attempt_num: int) -> tuple[bool, str]:
+        mode = self.cfg.normalized_verification_mode()
+        if mode == "fast":
+            return False, "mode=fast"
+        if mode == "strict":
+            return True, "mode=strict"
+
+        # Balanced mode: verify on retries or if redirect didn't explicitly include id={post_id},
+        # plus sample every Nth post in the current run.
+        uncertain = attempt_num > 1 or (status == 302 and f"id={post_id}" not in loc)
+        if uncertain:
+            return True, "mode=balanced(uncertain)"
+
+        sample_every = max(1, int(self.cfg.verify_sample_every))
+        if (self._success_streak + 1) % sample_every == 0:
+            return True, f"mode=balanced(sample_1_in_{sample_every})"
+
+        return False, "mode=balanced(skipped)"
+
+    async def _verify_view_page(
+        self,
+        view_url: str,
+        post_id: int,
+        clean_tags: str,
+        removed_tags: set[str],
+        attempt_num: int,
+    ) -> tuple[bool, str]:
+        await self.limiter.wait()
+        async with self.session.get(view_url) as r_ver:
+            ver_html = await r_ver.text()
+
+        ta_m = re.search(
+            r'<textarea[^>]*(?:id=["\']tags["\']|name=["\']tags["\'])[^>]*>(.*?)</textarea>',
+            ver_html,
+            re.S | re.I,
+        )
+        if not ta_m:
+            msg = "Missing tags textarea on verification GET"
+            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="no_textarea")
+            return False, msg
+
+        actual_set = {html.unescape(t) for t in html.unescape(ta_m.group(1)).split() if t.strip()}
+        expected_set = {html.unescape(t) for t in clean_tags.split() if t.strip()}
+        missing_added = expected_set - actual_set
+        still_present = ({html.unescape(t) for t in removed_tags}) & actual_set
+
+        if missing_added:
+            msg = f"Missing expected tags after save: {' '.join(sorted(missing_added))}"
+            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="missing_tags")
+            return False, msg
+
+        if still_present:
+            msg = f"Removed tags still present after save: {' '.join(sorted(still_present))}"
+            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="still_present")
+            return False, msg
+
+        self._log(
+            logging.INFO,
+            f"attempt={attempt_num} Updated and verified (tags={len(actual_set)})",
+            post_id=post_id,
+            action="verify",
+            status="ok",
+        )
+        return True, "Updated & verified"
 
     async def _submit_once(
         self,
@@ -344,43 +412,22 @@ class GelbooruAPI:
                 self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="submit_edit", status="redirect_mismatch")
                 return False, msg
 
-        await self.limiter.wait()
-        async with self.session.get(view_url) as r_ver:
-            ver_html = await r_ver.text()
+        do_verify, reason = self._should_verify_post(post_id, r_post.status, loc, attempt_num)
+        if not do_verify:
+            self._success_streak += 1
+            self._log(
+                logging.INFO,
+                f"attempt={attempt_num} Submitted ({reason}, status={r_post.status})",
+                post_id=post_id,
+                action="verify",
+                status="skipped",
+            )
+            return True, f"Submitted ({reason})"
 
-        ta_m = re.search(
-            r'<textarea[^>]*(?:id=["\']tags["\']|name=["\']tags["\'])[^>]*>(.*?)</textarea>',
-            ver_html,
-            re.S | re.I,
-        )
-        if not ta_m:
-            msg = "Missing tags textarea on verification GET"
-            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="no_textarea")
-            return False, msg
-
-        actual_set = {html.unescape(t) for t in html.unescape(ta_m.group(1)).split() if t.strip()}
-        expected_set = {html.unescape(t) for t in clean_tags.split() if t.strip()}
-        missing_added = expected_set - actual_set
-        still_present = ({html.unescape(t) for t in removed_tags}) & actual_set
-
-        if missing_added:
-            msg = f"Missing expected tags after save: {' '.join(sorted(missing_added))}"
-            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="missing_tags")
-            return False, msg
-
-        if still_present:
-            msg = f"Removed tags still present after save: {' '.join(sorted(still_present))}"
-            self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="still_present")
-            return False, msg
-
-        self._log(
-            logging.INFO,
-            f"attempt={attempt_num} Updated and verified (tags={len(actual_set)})",
-            post_id=post_id,
-            action="verify",
-            status="ok",
-        )
-        return True, "Updated & verified"
+        ok, msg = await self._verify_view_page(view_url, post_id, clean_tags, removed_tags, attempt_num)
+        if ok:
+            self._success_streak += 1
+        return ok, msg
 
     async def update_post(
         self,

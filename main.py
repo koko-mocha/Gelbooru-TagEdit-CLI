@@ -224,11 +224,24 @@ def configure_auth(cfg: Config, logger) -> None:
     rps = ask("Max requests/sec", str(cfg.max_rps))
     if rps.isdigit() and int(rps) > 0:
         cfg.max_rps = int(rps)
+
     auto_in = ask("Auto-confirm 'y' without prompting? (y/n)", "y" if cfg.auto_yes else "n").lower()
     if auto_in in ("y", "yes", "true", "1"):
         cfg.auto_yes = True
     elif auto_in in ("n", "no", "false", "0"):
         cfg.auto_yes = False
+
+    v_mode = ask(
+        "Verification mode (strict / balanced / fast)",
+        cfg.normalized_verification_mode(),
+    ).lower()
+    if v_mode in ("strict", "balanced", "fast"):
+        cfg.verification_mode = v_mode
+
+    if cfg.normalized_verification_mode() == "balanced":
+        sample_raw = ask("Balanced sample interval (verify 1 every N successes)", str(cfg.verify_sample_every))
+        if sample_raw.isdigit() and int(sample_raw) > 0:
+            cfg.verify_sample_every = int(sample_raw)
 
     cfg.save()
     logger.info(

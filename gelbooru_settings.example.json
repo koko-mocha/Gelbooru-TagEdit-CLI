@@ -4,5 +4,7 @@
   "user_id": "INSERT USER ID",
   "cookie_header": "INSERT REQUEST COOKIE HEADER",
   "max_rps": 10,
-  "auto_yes": false
+  "auto_yes": false,
+  "verification_mode": "balanced/strict/fast",
+  "verify_sample_every": 5
 }

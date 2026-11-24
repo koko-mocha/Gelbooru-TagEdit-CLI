@@ -5,6 +5,8 @@ import json
 import logging
 from pathlib import Path
 
+VALID_VERIFICATION_MODES = ("strict", "balanced", "fast")
+
 
 @dataclass
 class Config:
@@ -15,8 +17,14 @@ class Config:
     max_rps: int = 10
     page_limit: int = 100
     auto_yes: bool = False
+    verification_mode: str = "balanced"
+    verify_sample_every: int = 5
     settings_file: Path = Path("gelbooru_settings.json")
     debug_csv: Path = Path("logs/gelbooru_debug.csv")
+
+    def normalized_verification_mode(self) -> str:
+        mode = (self.verification_mode or "balanced").strip().lower()
+        return mode if mode in VALID_VERIFICATION_MODES else "balanced"
 
     def has_api_creds(self) -> bool:
         return bool(self.api_key.strip() and self.user_id.strip())
@@ -28,7 +36,12 @@ class Config:
         api_state = "SET" if self.has_api_creds() else "MISSING"
         cookie_state = "SET" if self.has_cookies() else "MISSING"
         auto_state = "ON" if self.auto_yes else "OFF"
-        return f"API Creds: {api_state} (uid={self.user_id or '-'}) | Cookies: {cookie_state} | Auto-Yes: {auto_state}"
+        v_mode = self.normalized_verification_mode()
+        v_detail = f"{v_mode} (1/{self.verify_sample_every})" if v_mode == "balanced" else v_mode
+        return (
+            f"API Creds: {api_state} (uid={self.user_id or '-'}) | "
+            f"Cookies: {cookie_state} | Auto-Yes: {auto_state} | Verify: {v_detail}"
+        )
 
     def load_saved(self) -> None:
         if self.settings_file.exists():
@@ -39,6 +52,9 @@ class Config:
             self.cookie_header = str(data.get("cookie_header", self.cookie_header)).strip()
             self.max_rps = max(1, int(data.get("max_rps", self.max_rps)))
             self.auto_yes = bool(data.get("auto_yes", self.auto_yes))
+            mode = str(data.get("verification_mode", self.verification_mode)).strip().lower()
+            self.verification_mode = mode if mode in VALID_VERIFICATION_MODES else "balanced"
+            self.verify_sample_every = max(1, int(data.get("verify_sample_every", self.verify_sample_every)))
 
     def save(self) -> None:
         payload = {
@@ -48,6 +64,8 @@ class Config:
             "cookie_header": self.cookie_header,
             "max_rps": self.max_rps,
             "auto_yes": self.auto_yes,
+            "verification_mode": self.normalized_verification_mode(),
+            "verify_sample_every": max(1, int(self.verify_sample_every)),
         }
         self.settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
