@@ -13,6 +13,11 @@ def ask(prompt: str, default: str = "") -> str:
     return val if val else default
 
 
+def ask_tags(prompt: str) -> list[str]:
+    # dict.fromkeys dedupes while keeping input order (split() never yields blank tokens)
+    return list(dict.fromkeys(ask(prompt).split()))
+
+
 def print_progress_bar(done: int, total: int, ok_cnt: int, fail_cnt: int, current_id: int) -> None:
     width = 24
     pct = (done / total) if total else 1.0
@@ -52,7 +57,7 @@ def format_compact_diff(
 
 async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
     if not cfg.has_api_creds():
-        print("API credentials are MISSING. Open Menu -> 4 first.")
+        print("API credentials are MISSING. Open Menu -> 5 first.")
         return
 
     raw_query = ask("Search tags or Gelbooru list URL")
@@ -61,10 +66,16 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
         print("Empty search query.")
         return
 
-    # dict.fromkeys dedupes while keeping input order (split() never yields blank tokens)
-    target_tags = list(dict.fromkeys(ask(f"Tags to {mode.upper()} (space-separated)").split()))
-    if not target_tags:
+    # mode: "add", "remove", or "edit" (add + remove in a single edit per post)
+    blank_hint = ", blank = none" if mode == "edit" else ""
+    add_tags = ask_tags(f"Tags to ADD (space-separated{blank_hint})") if mode in ("add", "edit") else []
+    remove_tags = ask_tags(f"Tags to REMOVE (space-separated{blank_hint})") if mode in ("remove", "edit") else []
+    if not add_tags and not remove_tags:
         print("No tags specified.")
+        return
+    overlap = set(add_tags).intersection(remove_tags)
+    if overlap:
+        print(f"Tags can't be both added and removed: {' '.join(sorted(overlap))}")
         return
 
     cap_raw = ask("Max posts (blank = all)", "")
@@ -76,7 +87,7 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
             print("No posts found.")
             return
 
-        target_set = set(target_tags)
+        remove_set = set(remove_tags)
         plan: list[tuple[int, list[str], list[str], str, str]] = []
 
         for p in posts:
@@ -87,15 +98,10 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
             rating = str(p.get("rating", ""))
             source = str(p.get("source", ""))
 
-            if mode == "remove":
-                if target_set.isdisjoint(old_set):
-                    continue
-                new_tags = [t for t in old_tags if t not in target_set]
-            else:
-                missing = [t for t in target_tags if t not in old_set]
-                if not missing:
-                    continue
-                new_tags = old_tags + missing
+            missing = [t for t in add_tags if t not in old_set]
+            if not missing and remove_set.isdisjoint(old_set):
+                continue
+            new_tags = [t for t in old_tags if t not in remove_set] + missing
 
             plan.append((pid, old_tags, new_tags, rating, source))
 
@@ -116,7 +122,6 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
         else:
             print("Auto-Yes enabled -> applying changes...")
 
-        removed_set = target_set if mode == "remove" else set()
         ok_cnt = fail_cnt = 0
         failures: list[str] = []
         total = len(plan)
@@ -127,7 +132,7 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
                 " ".join(new_t),
                 rating=r or None,
                 source=s,
-                removed_tags=removed_set,
+                removed_tags=remove_set,
             )
             if ok:
                 ok_cnt += 1
@@ -144,7 +149,7 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
 
 async def run_metadata_edit(cfg: Config, logger) -> None:
     if not cfg.has_api_creds():
-        print("API credentials are MISSING. Open Menu -> 4 first.")
+        print("API credentials are MISSING. Open Menu -> 5 first.")
         return
 
     raw_query = ask("Search tags or Gelbooru list URL")
@@ -270,9 +275,10 @@ async def menu_loop() -> None:
             print(f"[{cfg.auth_summary()}]")
             print("1. Remove tags from posts")
             print("2. Add tags to posts")
-            print("3. Modify metadata (rating / source)")
-            print("4. Credentials, Cookies & Auto-Yes")
-            print("5. Exit")
+            print("3. Edit all tags")
+            print("4. Edit metadata")
+            print("5. Settings")
+            print("6. Exit")
 
             choice = input("Choose: ").strip()
             try:
@@ -281,10 +287,12 @@ async def menu_loop() -> None:
                 elif choice == "2":
                     await run_tag_mutation(cfg, logger, "add")
                 elif choice == "3":
-                    await run_metadata_edit(cfg, logger)
+                    await run_tag_mutation(cfg, logger, "edit")
                 elif choice == "4":
-                    configure_auth(cfg, logger)
+                    await run_metadata_edit(cfg, logger)
                 elif choice == "5":
+                    configure_auth(cfg, logger)
+                elif choice == "6":
                     break
                 else:
                     print("Invalid choice.")

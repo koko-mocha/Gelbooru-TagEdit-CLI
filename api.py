@@ -185,7 +185,7 @@ class GelbooruAPI:
                         action="dapi_search",
                         status=str(resp.status),
                     )
-                    raise PermissionError(f"HTTP {resp.status} Unauthorized. Check API credentials in Menu -> 4.")
+                    raise PermissionError(f"HTTP {resp.status} Unauthorized. Check API credentials in Menu -> 5.")
                 if resp.status >= 500 or resp.status == 429:
                     if attempt < 2:
                         await asyncio.sleep(0.8 * (2**attempt))
@@ -525,7 +525,7 @@ class GelbooruAPI:
         removed_tags: set[str] | None = None,
     ) -> tuple[bool, str]:
         if not self.cfg.has_cookies():
-            msg = "No browser Cookie header stored (set in Menu -> 4)"
+            msg = "No browser Cookie header stored (set in Menu -> 5)"
             self._log(logging.WARNING, msg, post_id=post_id, action="update_post", status="no_cookie")
             return False, msg
 
