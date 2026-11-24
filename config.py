@@ -16,9 +16,11 @@ class Config:
     cookie_header: str = ""
     max_rps: int = 10
     page_limit: int = 100
+    search_concurrency: int = 4
     auto_yes: bool = False
     verification_mode: str = "balanced"
     verify_sample_every: int = 5
+    log_flush_every: int = 16
     settings_file: Path = Path("gelbooru_settings.json")
     debug_csv: Path = Path("logs/gelbooru_debug.csv")
 
@@ -51,10 +53,12 @@ class Config:
             self.user_id = str(data.get("user_id", self.user_id)).strip()
             self.cookie_header = str(data.get("cookie_header", self.cookie_header)).strip()
             self.max_rps = max(1, int(data.get("max_rps", self.max_rps)))
+            self.search_concurrency = max(1, int(data.get("search_concurrency", self.search_concurrency)))
             self.auto_yes = bool(data.get("auto_yes", self.auto_yes))
             mode = str(data.get("verification_mode", self.verification_mode)).strip().lower()
             self.verification_mode = mode if mode in VALID_VERIFICATION_MODES else "balanced"
             self.verify_sample_every = max(1, int(data.get("verify_sample_every", self.verify_sample_every)))
+            self.log_flush_every = max(1, int(data.get("log_flush_every", self.log_flush_every)))
 
     def save(self) -> None:
         payload = {
@@ -63,9 +67,11 @@ class Config:
             "user_id": self.user_id,
             "cookie_header": self.cookie_header,
             "max_rps": self.max_rps,
+            "search_concurrency": self.search_concurrency,
             "auto_yes": self.auto_yes,
             "verification_mode": self.normalized_verification_mode(),
             "verify_sample_every": max(1, int(self.verify_sample_every)),
+            "log_flush_every": max(1, int(self.log_flush_every)),
         }
         self.settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -73,41 +79,65 @@ class Config:
 class CsvDebugHandler(logging.Handler):
     FIELDNAMES = ["timestamp", "level", "source", "post_id", "action", "status", "detail"]
 
-    def __init__(self, csv_path: Path) -> None:
+    def __init__(self, csv_path: Path, flush_every: int = 16) -> None:
         super().__init__(level=logging.DEBUG)
         self.csv_path = csv_path
+        self.flush_every = max(1, flush_every)
+        self._pending = 0
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
-        with self.csv_path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
-            if write_header:
-                writer.writeheader()
+        self._file = self.csv_path.open("a", encoding="utf-8", newline="", buffering=65536)
+        self._writer = csv.writer(self._file)
+        if write_header:
+            self._writer.writerow(self.FIELDNAMES)
+            self._file.flush()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             extra = record.__dict__
-            row = {
-                "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                "level": record.levelname,
-                "source": f"{record.filename}:{record.lineno}",
-                "post_id": extra.get("post_id", ""),
-                "action": extra.get("action", ""),
-                "status": extra.get("status", ""),
-                "detail": self.format(record),
-            }
-            with self.csv_path.open("a", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
-                writer.writerow(row)
+            ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            row = [
+                ts,
+                record.levelname,
+                f"{record.filename}:{record.lineno}",
+                extra.get("post_id", ""),
+                extra.get("action", ""),
+                extra.get("status", ""),
+                self.format(record),
+            ]
+            self._writer.writerow(row)
+            self._pending += 1
+            if record.levelno >= logging.WARNING or self._pending >= self.flush_every:
+                self._file.flush()
+                self._pending = 0
         except Exception:
             self.handleError(record)
 
+    def flush(self) -> None:
+        try:
+            if not self._file.closed:
+                self._file.flush()
+                self._pending = 0
+        except Exception:
+            pass
 
-def setup_csv_logger(csv_path: Path) -> logging.Logger:
+    def close(self) -> None:
+        try:
+            self.flush()
+            if not self._file.closed:
+                self._file.close()
+        finally:
+            super().close()
+
+
+def setup_csv_logger(csv_path: Path, flush_every: int = 16) -> logging.Logger:
     logger = logging.getLogger("gelbooru_csv")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
+    for existing in logger.handlers:
+        existing.close()
     logger.handlers.clear()
-    handler = CsvDebugHandler(csv_path)
+    handler = CsvDebugHandler(csv_path, flush_every=flush_every)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
     return logger

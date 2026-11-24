@@ -1,14 +1,47 @@
 import asyncio
 from collections import deque
 import html
+import json
 import logging
+import math
 import re
 import time
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 import aiohttp
 
+try:
+    import orjson as _orjson  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    _orjson = None
+
 from config import Config
+
+# Precompiled once instead of being re-resolved on every post / every <input>.
+_RE_INPUT = re.compile(r"<input\b([^>]*)/?>", re.I)
+_RE_SELECT = re.compile(r"<select\b([^>]*)>(.*?)</select>", re.S | re.I)
+_RE_TEXTAREA = re.compile(r"<textarea\b([^>]*)>(.*?)</textarea>", re.S | re.I)
+_RE_ATTR_NAME = re.compile(r'\bname=["\']([^"\']+)["\']', re.I)
+_RE_ATTR_TYPE = re.compile(r'\btype=["\']([^"\']+)["\']', re.I)
+_RE_ATTR_VALUE = re.compile(r'\bvalue=["\']([^"\']*)["\']', re.I)
+_RE_CHECKED = re.compile(r"\bchecked\b", re.I)
+_RE_OPT_SELECTED = re.compile(r'<option\b[^>]*\bselected\b[^>]*value=["\']([^"\']*)["\']', re.I)
+_RE_OPT_FIRST = re.compile(r'<option\b[^>]*value=["\']([^"\']*)["\']', re.I)
+_RE_TAGS_TEXTAREA = re.compile(
+    r'<textarea[^>]*(?:id=["\']tags["\']|name=["\']tags["\'])[^>]*>(.*?)</textarea>', re.S | re.I
+)
+_RE_EDIT_FORM = re.compile(
+    r'<form[^>]*(?:id=["\']edit_form["\']|name=["\']edit_form["\'])[^>]*>(.*?)</form>', re.S | re.I
+)
+_RE_WS = re.compile(r"\s+")
+
+
+def _decode_json_bytes(raw: bytes) -> Any:
+    if not raw or not raw.strip():
+        return []
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw.decode("utf-8", errors="replace"))
 
 
 def parse_tags_input(raw: str) -> str:
@@ -64,6 +97,8 @@ class GelbooruAPI:
         action: str = "",
         status: str = "",
     ) -> None:
+        if not self.logger.isEnabledFor(level):
+            return
         safe_msg = _redact_text(msg, self.cfg.api_key)
         safe_msg = _redact_text(safe_msg, self.cfg.cookie_header)
         self.logger.log(
@@ -87,9 +122,11 @@ class GelbooruAPI:
         if cookie_val:
             headers["Cookie"] = cookie_val
 
+        connector = aiohttp.TCPConnector(limit=max(8, self.cfg.search_concurrency * 2), ttl_dns_cache=300)
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             headers=headers,
+            connector=connector,
             cookie_jar=aiohttp.CookieJar(unsafe=True),
         )
         return self
@@ -119,26 +156,32 @@ class GelbooruAPI:
             out["user_id"] = self.cfg.user_id
         return out
 
-    async def _get_json(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _get_json(self, params: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
+        """Returns (rows, total_count). total_count is None when the API doesn't report it."""
         url = f"{self.cfg.base_url}/index.php"
         query = {"page": "dapi", "s": "post", "q": "index", "json": "1", **self._auth(), **params}
+        debug_on = self.logger.isEnabledFor(logging.DEBUG)
 
         for attempt in range(3):
             await self.limiter.wait()
-            safe_q = {k: ("[REDACTED]" if k == "api_key" else v) for k, v in query.items()}
-            self._log(logging.DEBUG, f"GET {url} params={safe_q} attempt={attempt + 1}", action="dapi_search")
+            if debug_on:
+                safe_q = {k: ("[REDACTED]" if k == "api_key" else v) for k, v in query.items()}
+                self._log(logging.DEBUG, f"GET {url} params={safe_q} attempt={attempt + 1}", action="dapi_search")
             async with self.session.get(url, params=query) as resp:
-                body = await resp.text()
-                self._log(
-                    logging.DEBUG,
-                    f"DAPI response url={str(resp.url).replace(self.cfg.api_key, '[REDACTED]') if self.cfg.api_key else resp.url} status={resp.status} bytes={len(body)}",
-                    action="dapi_search",
-                    status=str(resp.status),
-                )
+                raw = await resp.read()
+                if debug_on:
+                    safe_url = str(resp.url).replace(self.cfg.api_key, "[REDACTED]") if self.cfg.api_key else str(resp.url)
+                    self._log(
+                        logging.DEBUG,
+                        f"DAPI response url={safe_url} status={resp.status} bytes={len(raw)}",
+                        action="dapi_search",
+                        status=str(resp.status),
+                    )
                 if resp.status in (401, 403):
+                    snippet = raw[:300].decode("utf-8", errors="replace")
                     self._log(
                         logging.ERROR,
-                        f"Auth rejected ({resp.status}): {body[:300]}",
+                        f"Auth rejected ({resp.status}): {snippet}",
                         action="dapi_search",
                         status=str(resp.status),
                     )
@@ -148,30 +191,39 @@ class GelbooruAPI:
                         await asyncio.sleep(0.8 * (2**attempt))
                         continue
                 resp.raise_for_status()
-                if not body.strip():
-                    return []
-                data = await resp.json(content_type=None)
+                data = _decode_json_bytes(raw)
                 if isinstance(data, list):
-                    return [x for x in data if isinstance(x, dict)]
+                    return [x for x in data if isinstance(x, dict)], None
                 if isinstance(data, dict):
+                    total: int | None = None
+                    attrs = data.get("@attributes")
+                    if isinstance(attrs, dict):
+                        try:
+                            total = int(attrs.get("count"))
+                        except (TypeError, ValueError):
+                            total = None
                     posts = data.get("post")
                     if isinstance(posts, list):
-                        return [x for x in posts if isinstance(x, dict)]
+                        return [x for x in posts if isinstance(x, dict)], total
                     if isinstance(posts, dict):
-                        return [posts]
+                        return [posts], total
                     if "id" in data:
-                        return [data]
-                return []
-        return []
+                        return [data], total
+                    return [], total
+                return [], None
+        return [], None
 
     async def search_posts(self, tags_query: str, max_posts: int | None = None) -> list[dict[str, Any]]:
+        limit = max(1, int(self.cfg.page_limit))
+        first_limit = min(limit, max_posts) if max_posts else limit
+        first_rows, total = await self._get_json({"tags": tags_query, "limit": first_limit, "pid": 0})
+        if not first_rows:
+            return []
+
         all_posts: list[dict[str, Any]] = []
         seen: set[int] = set()
-        pid = 0
-        while True:
-            rows = await self._get_json({"tags": tags_query, "limit": self.cfg.page_limit, "pid": pid})
-            if not rows:
-                break
+
+        def ingest(rows: list[dict[str, Any]]) -> int:
             added = 0
             for r in rows:
                 try:
@@ -183,51 +235,98 @@ class GelbooruAPI:
                     all_posts.append(r)
                     added += 1
                     if max_posts and len(all_posts) >= max_posts:
-                        return all_posts
-            if len(rows) < self.cfg.page_limit or added == 0:
+                        break
+            return added
+
+        ingest(first_rows)
+        if max_posts and len(all_posts) >= max_posts:
+            return all_posts
+        if len(first_rows) < first_limit:
+            return all_posts
+
+        # Last page index worth requesting, derived from the reported total and/or max_posts.
+        # Avoids firing whole speculative waves past the end of the result set.
+        target = total
+        if max_posts:
+            target = min(target, max_posts) if target is not None else max_posts
+        last_pid = math.ceil(target / limit) - 1 if target is not None else None
+
+        # Fetch subsequent pages in bounded parallel waves while respecting RateLimiter
+        sem = asyncio.Semaphore(max(1, int(self.cfg.search_concurrency)))
+        next_pid = 1
+        wave_size = max(2, int(self.cfg.search_concurrency) * 2)
+
+        async def fetch_page(page_idx: int) -> list[dict[str, Any]]:
+            async with sem:
+                rows, _ = await self._get_json({"tags": tags_query, "limit": limit, "pid": page_idx})
+                return rows
+
+        while last_pid is None or next_pid <= last_pid:
+            end_pid = next_pid + wave_size
+            if last_pid is not None:
+                end_pid = min(end_pid, last_pid + 1)
+            pids = range(next_pid, end_pid)
+            next_pid = end_pid
+            # gather preserves input order, so no sort is needed
+            results = await asyncio.gather(*(fetch_page(p) for p in pids))
+
+            hit_short_page = False
+            for rows in results:
+                if not rows:
+                    hit_short_page = True
+                    break
+                added = ingest(rows)
+                if max_posts and len(all_posts) >= max_posts:
+                    hit_short_page = True
+                    break
+                if len(rows) < limit or added == 0:
+                    hit_short_page = True
+                    break
+
+            if hit_short_page:
                 break
-            pid += 1
+
         return all_posts
 
     def _extract_form_payload(self, form_body: str) -> dict[str, str]:
         payload: dict[str, str] = {}
 
-        for m in re.finditer(r"<input\b([^>]*)/?>", form_body, re.I):
+        for m in _RE_INPUT.finditer(form_body):
             attrs = m.group(1)
-            nm = re.search(r'\bname=["\']([^"\']+)["\']', attrs, re.I)
+            nm = _RE_ATTR_NAME.search(attrs)
             if not nm:
                 continue
             name = html.unescape(nm.group(1))
-            tm = re.search(r'\btype=["\']([^"\']+)["\']', attrs, re.I)
+            tm = _RE_ATTR_TYPE.search(attrs)
             itype = tm.group(1).lower() if tm else "text"
-            vm = re.search(r'\bvalue=["\']([^"\']*)["\']', attrs, re.I)
+            vm = _RE_ATTR_VALUE.search(attrs)
             val = html.unescape(vm.group(1)) if vm else ""
             if itype == "radio":
-                if re.search(r"\bchecked\b", attrs, re.I):
+                if _RE_CHECKED.search(attrs):
                     payload[name] = val
             elif itype == "checkbox":
-                if re.search(r"\bchecked\b", attrs, re.I):
+                if _RE_CHECKED.search(attrs):
                     payload[name] = val or "on"
             else:
                 payload[name] = val
 
-        for sm in re.finditer(r'<select\b([^>]*)>(.*?)</select>', form_body, re.S | re.I):
+        for sm in _RE_SELECT.finditer(form_body):
             s_attrs, s_body = sm.group(1), sm.group(2)
-            snm = re.search(r'\bname=["\']([^"\']+)["\']', s_attrs, re.I)
+            snm = _RE_ATTR_NAME.search(s_attrs)
             if not snm:
                 continue
             s_name = html.unescape(snm.group(1))
-            opt_sel = re.search(r'<option\b[^>]*\bselected\b[^>]*value=["\']([^"\']*)["\']', s_body, re.I)
+            opt_sel = _RE_OPT_SELECTED.search(s_body)
             if opt_sel:
                 payload[s_name] = html.unescape(opt_sel.group(1))
             else:
-                opt_first = re.search(r'<option\b[^>]*value=["\']([^"\']*)["\']', s_body, re.I)
+                opt_first = _RE_OPT_FIRST.search(s_body)
                 if opt_first:
                     payload[s_name] = html.unescape(opt_first.group(1))
 
-        for tam in re.finditer(r'<textarea\b([^>]*)>(.*?)</textarea>', form_body, re.S | re.I):
+        for tam in _RE_TEXTAREA.finditer(form_body):
             ta_attrs, ta_val = tam.group(1), tam.group(2)
-            tanm = re.search(r'\bname=["\']([^"\']+)["\']', ta_attrs, re.I)
+            tanm = _RE_ATTR_NAME.search(ta_attrs)
             if not tanm:
                 continue
             ta_name = html.unescape(tanm.group(1))
@@ -243,8 +342,6 @@ class GelbooruAPI:
         if mode == "strict":
             return True, "mode=strict"
 
-        # Balanced mode: verify on retries or if redirect didn't explicitly include id={post_id},
-        # plus sample every Nth post in the current run.
         uncertain = attempt_num > 1 or (status == 302 and f"id={post_id}" not in loc)
         if uncertain:
             return True, "mode=balanced(uncertain)"
@@ -267,11 +364,7 @@ class GelbooruAPI:
         async with self.session.get(view_url) as r_ver:
             ver_html = await r_ver.text()
 
-        ta_m = re.search(
-            r'<textarea[^>]*(?:id=["\']tags["\']|name=["\']tags["\'])[^>]*>(.*?)</textarea>',
-            ver_html,
-            re.S | re.I,
-        )
+        ta_m = _RE_TAGS_TEXTAREA.search(ver_html)
         if not ta_m:
             msg = "Missing tags textarea on verification GET"
             self._log(logging.WARNING, f"attempt={attempt_num} {msg}", post_id=post_id, action="verify", status="no_textarea")
@@ -325,11 +418,7 @@ class GelbooruAPI:
                 status=str(r_get.status),
             )
 
-        form_m = re.search(
-            r'<form[^>]*(?:id=["\']edit_form["\']|name=["\']edit_form["\'])[^>]*>(.*?)</form>',
-            html_text,
-            re.S | re.I,
-        )
+        form_m = _RE_EDIT_FORM.search(html_text)
         if not form_m:
             notice_m = re.search(r'<div[^>]*(?:class|id)=["\'][^"\']*(?:notice|error|alert)[^"\']*["\'][^>]*>(.*?)</div>', html_text, re.S | re.I)
             notice_txt = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", notice_m.group(1)))).strip()[:200] if notice_m else ""
@@ -341,19 +430,17 @@ class GelbooruAPI:
         payload = self._extract_form_payload(form_body)
 
         clean_tags = html.unescape(tags_str).strip()
-        ta_orig = re.search(
-            r'<textarea[^>]*(?:id=["\']tags["\']|name=["\']tags["\'])[^>]*>(.*?)</textarea>',
-            form_body,
-            re.S | re.I,
-        )
+        ta_orig = _RE_TAGS_TEXTAREA.search(form_body)
         if ta_orig:
-            page_tags = [html.unescape(t) for t in html.unescape(ta_orig.group(1)).split() if t.strip()]
+            page_tags = [html.unescape(t) for t in html.unescape(ta_orig.group(1)).split()]
             rem_set = {html.unescape(t) for t in removed_tags}
-            add_set = {html.unescape(t) for t in clean_tags.split()} - set(page_tags)
+            # Set membership instead of `t not in merged` (list scan): O(n + m) instead of O(n * m)
+            seen = set(page_tags)
             merged = [t for t in page_tags if t not in rem_set]
             for t in clean_tags.split():
                 t_clean = html.unescape(t)
-                if t_clean in add_set and t_clean not in merged:
+                if t_clean not in seen:
+                    seen.add(t_clean)
                     merged.append(t_clean)
             clean_tags = " ".join(merged)
 
@@ -395,7 +482,7 @@ class GelbooruAPI:
             loc = (r_post.headers.get("Location") or "").strip()
             set_cookies = [v.split("=", 1)[0].strip() for v in r_post.headers.getall("Set-Cookie", [])]
             post_body = await r_post.text()
-            body_snip = re.sub(r"\s+", " ", post_body).strip()[:220]
+            body_snip = _RE_WS.sub(" ", post_body[:2000]).strip()[:220]
             self._log(
                 logging.DEBUG,
                 f"attempt={attempt_num} POST edit_post.php status={r_post.status} location='{loc}' set_cookies={set_cookies} body='{body_snip}'",

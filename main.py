@@ -34,8 +34,10 @@ def format_compact_diff(
     old_s: str,
     new_s: str,
 ) -> str:
-    added = [t for t in new_tags if t not in set(old_tags)]
-    removed = [t for t in old_tags if t not in set(new_tags)]
+    old_set = set(old_tags)
+    new_set = set(new_tags)
+    added = [t for t in new_tags if t not in old_set]
+    removed = [t for t in old_tags if t not in new_set]
     parts: list[str] = []
     if added:
         parts.append("+ " + " ".join(added))
@@ -59,7 +61,8 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
         print("Empty search query.")
         return
 
-    target_tags = [t.strip() for t in ask(f"Tags to {mode.upper()} (space-separated)").split() if t.strip()]
+    # dict.fromkeys dedupes while keeping input order (split() never yields blank tokens)
+    target_tags = list(dict.fromkeys(ask(f"Tags to {mode.upper()} (space-separated)").split()))
     if not target_tags:
         print("No tags specified.")
         return
@@ -73,26 +76,28 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
             print("No posts found.")
             return
 
+        target_set = set(target_tags)
         plan: list[tuple[int, list[str], list[str], str, str]] = []
+
         for p in posts:
             pid = int(p["id"])
-            old_tags = [t for t in str(p.get("tags", "")).split() if t]
+            raw_tags = str(p.get("tags", ""))
+            old_tags = raw_tags.split() if raw_tags else []
+            old_set = set(old_tags)
             rating = str(p.get("rating", ""))
             source = str(p.get("source", ""))
 
             if mode == "remove":
-                rem = set(target_tags)
-                new_tags = [t for t in old_tags if t not in rem]
+                if target_set.isdisjoint(old_set):
+                    continue
+                new_tags = [t for t in old_tags if t not in target_set]
             else:
-                seen = set(old_tags)
-                new_tags = list(old_tags)
-                for t in target_tags:
-                    if t not in seen:
-                        seen.add(t)
-                        new_tags.append(t)
+                missing = [t for t in target_tags if t not in old_set]
+                if not missing:
+                    continue
+                new_tags = old_tags + missing
 
-            if new_tags != old_tags:
-                plan.append((pid, old_tags, new_tags, rating, source))
+            plan.append((pid, old_tags, new_tags, rating, source))
 
         if not plan:
             print(f"No posts require '{mode}' changes.")
@@ -111,7 +116,7 @@ async def run_tag_mutation(cfg: Config, logger, mode: str) -> None:
         else:
             print("Auto-Yes enabled -> applying changes...")
 
-        removed_set = set(target_tags) if mode == "remove" else set()
+        removed_set = target_set if mode == "remove" else set()
         ok_cnt = fail_cnt = 0
         failures: list[str] = []
         total = len(plan)
@@ -176,7 +181,7 @@ async def run_metadata_edit(cfg: Config, logger) -> None:
 
         print(f"\nMetadata Preview ({len(plan)} post(s)):")
         for pid, t_str, old_r, tgt_r, old_s, tgt_s in plan[:15]:
-            t_list = t_str.split()
+            t_list = t_str.split() if t_str else []
             print(format_compact_diff(pid, t_list, t_list, old_r, tgt_r, old_s, tgt_s))
         if len(plan) > 15:
             print(f"  ... +{len(plan) - 15} more")
@@ -225,16 +230,17 @@ def configure_auth(cfg: Config, logger) -> None:
     if rps.isdigit() and int(rps) > 0:
         cfg.max_rps = int(rps)
 
+    conc = ask("Search page concurrency", str(cfg.search_concurrency))
+    if conc.isdigit() and int(conc) > 0:
+        cfg.search_concurrency = int(conc)
+
     auto_in = ask("Auto-confirm 'y' without prompting? (y/n)", "y" if cfg.auto_yes else "n").lower()
     if auto_in in ("y", "yes", "true", "1"):
         cfg.auto_yes = True
     elif auto_in in ("n", "no", "false", "0"):
         cfg.auto_yes = False
 
-    v_mode = ask(
-        "Verification mode (strict / balanced / fast)",
-        cfg.normalized_verification_mode(),
-    ).lower()
+    v_mode = ask("Verification mode (strict / balanced / fast)", cfg.normalized_verification_mode()).lower()
     if v_mode in ("strict", "balanced", "fast"):
         cfg.verification_mode = v_mode
 
@@ -255,38 +261,42 @@ def configure_auth(cfg: Config, logger) -> None:
 async def menu_loop() -> None:
     cfg = Config()
     cfg.load_saved()
-    logger = setup_csv_logger(cfg.debug_csv)
+    logger = setup_csv_logger(cfg.debug_csv, flush_every=cfg.log_flush_every)
     logger.info("CLI started", extra={"action": "startup", "status": "ok"})
 
-    while True:
-        print("\n=== Gelbooru CLI ===")
-        print(f"[{cfg.auth_summary()}]")
-        print("1. Remove tags from posts")
-        print("2. Add tags to posts")
-        print("3. Modify metadata (rating / source)")
-        print("4. Credentials, Cookies & Auto-Yes")
-        print("5. Exit")
+    try:
+        while True:
+            print("\n=== Gelbooru CLI ===")
+            print(f"[{cfg.auth_summary()}]")
+            print("1. Remove tags from posts")
+            print("2. Add tags to posts")
+            print("3. Modify metadata (rating / source)")
+            print("4. Credentials, Cookies & Auto-Yes")
+            print("5. Exit")
 
-        choice = input("Choose: ").strip()
-        try:
-            if choice == "1":
-                await run_tag_mutation(cfg, logger, "remove")
-            elif choice == "2":
-                await run_tag_mutation(cfg, logger, "add")
-            elif choice == "3":
-                await run_metadata_edit(cfg, logger)
-            elif choice == "4":
-                configure_auth(cfg, logger)
-            elif choice == "5":
-                break
-            else:
-                print("Invalid choice.")
-        except Exception as exc:
-            logger.error(
-                f"Unhandled error: {exc}\n{traceback.format_exc()}",
-                extra={"action": "menu_loop", "status": "error"},
-            )
-            print(f"Error: {exc} (details in {cfg.debug_csv})")
+            choice = input("Choose: ").strip()
+            try:
+                if choice == "1":
+                    await run_tag_mutation(cfg, logger, "remove")
+                elif choice == "2":
+                    await run_tag_mutation(cfg, logger, "add")
+                elif choice == "3":
+                    await run_metadata_edit(cfg, logger)
+                elif choice == "4":
+                    configure_auth(cfg, logger)
+                elif choice == "5":
+                    break
+                else:
+                    print("Invalid choice.")
+            except Exception as exc:
+                logger.error(
+                    f"Unhandled error: {exc}\n{traceback.format_exc()}",
+                    extra={"action": "menu_loop", "status": "error"},
+                )
+                print(f"Error: {exc} (details in {cfg.debug_csv})")
+    finally:
+        for h in logger.handlers:
+            h.flush()
 
 
 if __name__ == "__main__":
