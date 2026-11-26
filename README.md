@@ -1,4 +1,4 @@
-# Gelbooru Bulk Tag & Metadata Manager CLI
+# Gelbooru-TagEdit-CLI
 
 A simple CLI application for frequent Gelbooru taggers and Gardeners of Gelbooru via official Gelbooru's API. Runs in the background within the customizable usage limits.
 
